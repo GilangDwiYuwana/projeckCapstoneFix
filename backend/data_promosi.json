@@ -1,0 +1,14 @@
+[
+  {
+    "id": 1,
+    "title": "Promo Lebaran",
+    "detail": "Diskon 5% untuk semua tipe matic.",
+    "author": "Owner"
+  },
+  {
+    "id": 2,
+    "title": "Flash Sale Akhir Pekan",
+    "detail": "Cashback Rp1jt untuk pembelian tunai.",
+    "author": "Owner"
+  }
+]

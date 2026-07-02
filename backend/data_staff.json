@@ -1,0 +1,10 @@
+[
+  {
+    "id": "staff-1",
+    "name": "Staff Demo",
+    "email": "staff@honda.com",
+    "password": "staff123",
+    "phone": "08123456789",
+    "role": "staff"
+  }
+]

@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "nama": "Honda Vario 160",
+    "stok": 18
+  },
+  {
+    "id": 2,
+    "nama": "Honda CBR150R",
+    "stok": 6
+  },
+  {
+    "id": 3,
+    "nama": "Honda Beat",
+    "stok": 24
+  }
+]

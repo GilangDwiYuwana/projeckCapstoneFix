@@ -1,0 +1,23 @@
+[
+  {
+    "id": 1,
+    "name": "Vario 160 ABS",
+    "category": "Matic",
+    "price": 28000000,
+    "stock": 18
+  },
+  {
+    "id": 2,
+    "name": "CBR250RR SP",
+    "category": "Sport",
+    "price": 72000000,
+    "stock": 6
+  },
+  {
+    "id": 3,
+    "name": "Beat Deluxe",
+    "category": "Matic",
+    "price": 19500000,
+    "stock": 24
+  }
+]
