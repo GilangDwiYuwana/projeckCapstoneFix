@@ -1,0 +1,632 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Optional
+from sqlalchemy import text
+from datetime import datetime, date
+import xgboost as xgb
+import joblib
+import numpy as np
+import pandas as pd
+import subprocess
+import os
+import logging
+import io
+import csv
+import bcrypt
+
+from database import engine
+
+# ------------------------
+# SETUP
+# ------------------------
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------
+# AI MODEL
+# ------------------------
+model = xgb.XGBRegressor()
+le_produk = None
+le_metode = None
+model_ready = False
+
+
+def load_ai_assets():
+    global model, le_produk, le_metode, model_ready
+    model_ready = False
+    try:
+        loaded_any = False
+
+        if os.path.exists("model_omset.json"):
+            try:
+                model.load_model("model_omset.json")
+                logger.info("Model berhasil dimuat dari model_omset.json.")
+                loaded_any = True
+            except Exception as e:
+                logger.error(f"Gagal load_model: {e}")
+
+        if os.path.exists("le_produk.pkl") and os.path.exists("le_metode.pkl"):
+            try:
+                le_produk = joblib.load("le_produk.pkl")
+                le_metode = joblib.load("le_metode.pkl")
+                logger.info("Encoder (le_produk, le_metode) berhasil dimuat.")
+                loaded_any = True
+            except Exception as e:
+                logger.error(f"Gagal memuat encoder label: {e}")
+
+        model_ready = loaded_any and (le_produk is not None) and (le_metode is not None)
+        if not model_ready:
+            logger.warning("AI assets tidak lengkap: model_ready=False")
+        else:
+            logger.info("AI assets siap: model_ready=True")
+    except Exception as e:
+        logger.error(f"Gagal memuat aset AI: {e}")
+        model_ready = False
+
+# Load assets at startup
+load_ai_assets()
+
+# ------------------------
+# Pydantic models
+# ------------------------
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    role: str
+
+class ProdukCreate(BaseModel):
+    nama_motor: str
+    kategori: str
+    harga_terbaru: float
+    stok_awal: Optional[int] = 0
+
+class ProdukUpdate(BaseModel):
+    nama_motor: str
+    kategori: str
+    harga_terbaru: float
+
+class StokUpdate(BaseModel):
+    action: str
+    jumlah: int
+    alamat: Optional[str] = "-"
+    keterangan: Optional[str] = ""
+    id_user: int
+
+class StaffCreate(BaseModel):
+    nama_lengkap: str
+    email: str
+    password: str
+    phone: Optional[str] = ""
+
+class TargetUpdate(BaseModel):
+    bulan_tahun: str
+    target_unit: int
+    estimasi_omset: float
+
+class PromosiCreate(BaseModel):
+    title: str
+    detail: str
+    author: Optional[str] = "Owner"
+
+class LaporanCreate(BaseModel):
+    petugas: str
+    units: int
+    omset: float
+    filename: Optional[str] = ""
+
+# ------------------------
+# Helpers
+# ------------------------
+
+def hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def row_to_dict(row):
+    return dict(row._mapping)
+
+# Ensure extra tables exist
+def init_extra_tables():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS promosi (
+                id_promosi INT AUTO_INCREMENT PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                detail TEXT NOT NULL,
+                author VARCHAR(255) DEFAULT 'Owner',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS laporan_staff (
+                id_laporan INT AUTO_INCREMENT PRIMARY KEY,
+                petugas VARCHAR(255) NOT NULL,
+                units INT NOT NULL,
+                omset DECIMAL(15,2) NOT NULL,
+                filename VARCHAR(255),
+                tanggal TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+    logger.info("Tabel promosi & laporan_staff siap.")
+
+init_extra_tables()
+
+# ------------------------
+# Auth and utilities
+# ------------------------
+
+def normalize_role_for_frontend(db_role: str) -> str:
+    db_role_lower = db_role.lower()
+    if db_role_lower in ("owner", "admin"):
+        return "owner"
+    return "staff"
+
+@app.post("/login")
+def login(req: LoginRequest):
+    if req.role == "owner":
+        allowed_db_roles = ["Owner", "Admin"]
+    else:
+        allowed_db_roles = ["Staff"]
+
+    roles_clause = ",".join([f"'{r}'" for r in allowed_db_roles])
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(f"""
+                SELECT * FROM users
+                WHERE email = :email
+                  AND role IN ({roles_clause})
+                  AND status = 'Aktif'
+            """),
+            {"email": req.email}
+        ).fetchone()
+
+    if not result:
+        raise HTTPException(status_code=401, detail="Email atau password salah.")
+
+    user = row_to_dict(result)
+    stored = user.get("password_hash") or user.get("password")
+    valid = False
+    if isinstance(stored, str) and (stored.startswith("$2b$") or stored.startswith("$2a$")):
+        valid = verify_password(req.password, stored)
+    else:
+        valid = (stored == req.password)
+
+    if not valid:
+        raise HTTPException(status_code=401, detail="Email atau password salah.")
+
+    return {
+        "status": "success",
+        "user": {
+            "id": user.get("id_user"),
+            "name": user.get("nama_lengkap"),
+            "email": user.get("email"),
+            "role": normalize_role_for_frontend(user.get("role", "Staff")),
+            "db_role": user.get("role"),
+        }
+    }
+
+# ------------------------
+# Produk endpoints
+# ------------------------
+@app.get("/produk")
+def get_produk():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT p.id_produk AS id, p.nama_motor AS name, p.kategori AS category,
+                   p.harga_terbaru AS price, COALESCE(s.sisa_stok, 0) AS stock
+            FROM produk p
+            LEFT JOIN stok_barang s ON s.id_produk = p.id_produk
+            ORDER BY p.id_produk
+        """)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+@app.post("/produk")
+def add_produk(payload: ProdukCreate):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("INSERT INTO produk (nama_motor, kategori, harga_terbaru) VALUES (:nama, :kategori, :harga)"),
+            {"nama": payload.nama_motor, "kategori": payload.kategori, "harga": payload.harga_terbaru}
+        )
+        new_id = result.lastrowid
+        conn.execute(
+            text("INSERT INTO stok_barang (id_produk, sisa_stok) VALUES (:id_produk, :stok)"),
+            {"id_produk": new_id, "stok": payload.stok_awal}
+        )
+    return {
+        "id": new_id, "name": payload.nama_motor, "category": payload.kategori,
+        "price": payload.harga_terbaru, "stock": payload.stok_awal
+    }
+
+@app.put("/produk/{produk_id}")
+def update_produk(produk_id: int, payload: ProdukUpdate):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("UPDATE produk SET nama_motor=:nama, kategori=:kategori, harga_terbaru=:harga WHERE id_produk=:id"),
+            {"nama": payload.nama_motor, "kategori": payload.kategori, "harga": payload.harga_terbaru, "id": produk_id}
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Produk tidak ditemukan.")
+        stok_row = conn.execute(
+            text("SELECT sisa_stok FROM stok_barang WHERE id_produk=:id"), {"id": produk_id}
+        ).fetchone()
+    stok = stok_row[0] if stok_row else 0
+    return {"id": produk_id, "name": payload.nama_motor, "category": payload.kategori,
+            "price": payload.harga_terbaru, "stock": stok}
+
+@app.delete("/produk/{produk_id}")
+def delete_produk(produk_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM stok_barang WHERE id_produk=:id"), {"id": produk_id})
+        conn.execute(text("DELETE FROM produk WHERE id_produk=:id"), {"id": produk_id})
+    return {"status": "success"}
+
+# ------------------------
+# Stok endpoints
+# ------------------------
+@app.get("/stok")
+def get_stok():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT s.id_produk AS id, p.nama_motor AS nama, s.sisa_stok AS stok
+            FROM stok_barang s
+            JOIN produk p ON p.id_produk = s.id_produk
+            ORDER BY p.nama_motor
+        """)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+@app.post("/stok/{produk_id}/update")
+def update_stok(produk_id: int, payload: StokUpdate):
+    with engine.begin() as conn:
+        current = conn.execute(
+            text("SELECT sisa_stok FROM stok_barang WHERE id_produk=:id"), {"id": produk_id}
+        ).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="Item stok tidak ditemukan.")
+
+        sisa_stok = current[0]
+        if payload.action == "masuk":
+            sisa_stok += payload.jumlah
+        elif payload.action == "keluar":
+            if payload.jumlah > sisa_stok:
+                raise HTTPException(status_code=400, detail="Stok tidak mencukupi.")
+            sisa_stok -= payload.jumlah
+        else:
+            raise HTTPException(status_code=400, detail="Action tidak valid (masuk/keluar).")
+
+        conn.execute(
+            text("UPDATE stok_barang SET sisa_stok=:stok, update_terakhir=NOW() WHERE id_produk=:id"),
+            {"stok": sisa_stok, "id": produk_id}
+        )
+
+        keterangan = payload.keterangan or ("Barang Masuk" if payload.action == "masuk" else "Barang Keluar")
+        if payload.action == "keluar" and payload.alamat and payload.alamat != "-":
+            keterangan = f"{keterangan} | Alamat: {payload.alamat}"
+
+        conn.execute(
+            text("""INSERT INTO riwayat_stok (id_produk, id_user, jenis_pergerakan, jumlah, keterangan)
+                     VALUES (:id_produk, :id_user, :jenis, :jumlah, :keterangan)"""),
+            {"id_produk": produk_id, "id_user": payload.id_user, "jenis": payload.action,
+             "jumlah": payload.jumlah, "keterangan": keterangan}
+        )
+
+        nama_row = conn.execute(text("SELECT nama_motor FROM produk WHERE id_produk=:id"), {"id": produk_id}).fetchone()
+        nama = nama_row[0] if nama_row else ""
+
+    return {
+        "stok": {"id": produk_id, "nama": nama, "stok": sisa_stok},
+        "riwayat": {
+            "id": produk_id, "tanggal": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "nama": nama, "jenis": payload.action, "jumlah": payload.jumlah,
+            "alamat": payload.alamat if payload.action == "keluar" else "-",
+            "keterangan": keterangan, "petugas": f"User #{payload.id_user}",
+        }
+    }
+
+@app.get("/stok/riwayat")
+def get_riwayat():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT r.id_riwayat AS id, r.tanggal_pencatatan AS tanggal, p.nama_motor AS nama,
+                   r.jenis_pergerakan AS jenis, r.jumlah AS jumlah, r.keterangan AS keterangan,
+                   u.nama_lengkap AS petugas
+            FROM riwayat_stok r
+            JOIN produk p ON p.id_produk = r.id_produk
+            LEFT JOIN users u ON u.id_user = r.id_user
+            ORDER BY r.tanggal_pencatatan DESC
+            LIMIT 200
+        """)).fetchall()
+
+    result = []
+    for r in rows:
+        d = row_to_dict(r)
+        d["tanggal"] = d["tanggal"].strftime("%Y-%m-%d %H:%M") if isinstance(d["tanggal"], datetime) else str(d["tanggal"])
+        alamat = "-"
+        if d["keterangan"] and "| Alamat:" in d["keterangan"]:
+            parts = d["keterangan"].split("| Alamat:")
+            d["keterangan"] = parts[0].strip()
+            alamat = parts[1].strip()
+        d["alamat"] = alamat
+        result.append(d)
+    return result
+
+# ------------------------
+# Dataset & AI helpers
+# ------------------------
+@app.get("/check-dataset")
+def check_dataset():
+    with engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM data_penjualan")).fetchone()[0]
+    return {"exists": count > 0, "rows": count}
+
+@app.post("/upload-dataset")
+async def upload_dataset(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+
+        required_cols = {"Tanggal", "Produk", "Jenis_Motor", "Jumlah_Terjual", "Harga_Satuan", "Total_Penjualan", "Metode_Bayar"}
+        if not required_cols.issubset(set(df.columns)):
+            raise HTTPException(status_code=400, detail=f"Kolom CSV tidak sesuai. Wajib ada: {', '.join(required_cols)}")
+
+        df["Tanggal"] = pd.to_datetime(df["Tanggal"])
+
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM data_penjualan"))
+            for _, row in df.iterrows():
+                conn.execute(
+                    text("""INSERT INTO data_penjualan
+                             (Tanggal, Produk, Jenis_Motor, Jumlah_Terjual, Harga_Satuan, Total_Penjualan, Metode_Bayar)
+                             VALUES (:tanggal, :produk, :jenis, :jumlah, :harga_satuan, :total, :metode)"""),
+                    {
+                        "tanggal": row["Tanggal"].to_pydatetime(),
+                        "produk": str(row["Produk"]),
+                        "jenis": str(row["Jenis_Motor"]),
+                        "jumlah": int(row["Jumlah_Terjual"]),
+                        "harga_satuan": int(row["Harga_Satuan"]),
+                        "total": int(row["Total_Penjualan"]),
+                        "metode": str(row["Metode_Bayar"]),
+                    }
+                )
+
+        return {"status": "success", "message": f"Dataset berhasil diunggah! {len(df)} baris dimasukkan ke database."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("upload_dataset error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/retrain")
+def run_retrain():
+    try:
+        # jalankan script yang sudah Anda siapkan (train_model.py)
+        result = subprocess.run(["python", "train_model.py"], capture_output=True, text=True)
+        if result.returncode == 0:
+            load_ai_assets()
+            return {"status": "success", "message": "Model berhasil dilatih ulang!"}
+        logger.error("retrain stderr: %s", result.stderr)
+        return {"status": "error", "message": result.stderr}
+    except Exception as e:
+        logger.exception("retrain error")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/prediksi-tren")
+def get_prediksi_tren(produk: str, metode: str, jumlah_bulan: int):
+    if not model_ready or le_produk is None or le_metode is None:
+        raise HTTPException(status_code=400, detail="Model atau encoder belum dimuat. Lakukan Training / pastikan file model & encoder ada.")
+
+    now = datetime.now()
+    hasil = []
+    for i in range(1, jumlah_bulan + 1):
+        total_bulan  = now.month + i - 1
+        target_tahun = now.year + (total_bulan // 12)
+        target_bulan = (total_bulan % 12) + 1
+
+        try:
+            p_enc = le_produk.transform([produk])[0]
+            m_enc = le_metode.transform([metode])[0]
+        except Exception as ve:
+            logger.error(f"LabelEncoder transform error: produk={produk}, metode={metode}, err={ve}")
+            raise HTTPException(status_code=400, detail=f"Produk '{produk}' atau metode '{metode}' tidak dikenal.")
+
+        features = np.array([[float(p_enc), float(m_enc), float(target_tahun), float(target_bulan)]], dtype=float)
+
+        try:
+            pred_raw = model.predict(features)[0]
+            pred = float(pred_raw)
+        except Exception as e:
+            logger.error(f"Prediksi gagal untuk fitur {features.tolist()}: {e}")
+            raise HTTPException(status_code=500, detail="Gagal melakukan prediksi (model error).")
+
+        logger.debug(f"prediksi input => produk:{produk} (enc={p_enc}), metode:{metode} (enc={m_enc}), year:{target_tahun}, month:{target_bulan} => pred={pred}")
+
+        if pred < 50000000:
+            rec = "Omset rendah, saran: promo diskon."
+        elif pred > 100000000:
+            rec = "Omset tinggi, fokus pelayanan VIP."
+        else:
+            rec = "Stok aman, pertahankan penjualan."
+
+        hasil.append({"bulan": f"{target_bulan}-{target_tahun}", "omset": round(pred, 2), "rekomendasi": rec})
+
+    return {"data_tren": hasil}
+
+# ------------------------
+# Staff endpoints
+# ------------------------
+@app.get("/staff")
+def get_staff():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT id_user AS id, nama_lengkap AS name, email, role
+            FROM users WHERE role = 'Staff'
+            ORDER BY id_user DESC
+        """)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+@app.post("/staff")
+def create_staff(payload: StaffCreate):
+    with engine.connect() as conn:
+        existing = conn.execute(text("SELECT id_user FROM users WHERE email=:email"), {"email": payload.email}).fetchone()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email sudah terdaftar.")
+
+    hashed = hash_password(payload.password)
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""INSERT INTO users (nama_lengkap, email, password_hash, role, status)
+                     VALUES (:nama, :email, :pw, 'Staff', 'Aktif')"""),
+            {"nama": payload.nama_lengkap, "email": payload.email, "pw": hashed}
+        )
+        new_id = result.lastrowid
+    return {"id": new_id, "name": payload.nama_lengkap, "email": payload.email, "phone": payload.phone, "role": "staff"}
+
+@app.delete("/staff/{staff_id}")
+def delete_staff(staff_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM users WHERE id_user=:id AND role='Staff'"), {"id": staff_id})
+    return {"status": "success"}
+
+# ------------------------
+# Target endpoints
+# ------------------------
+@app.get("/target")
+def get_target():
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT * FROM target_bulanan ORDER BY bulan_tahun DESC LIMIT 1")).fetchone()
+    if not row:
+        return {"period": "Belum diatur", "omset": 0, "sales": 0}
+    d = row_to_dict(row)
+    bulan_tahun = d["bulan_tahun"]
+    period = bulan_tahun.strftime("%B %Y") if isinstance(bulan_tahun, date) else str(bulan_tahun)
+    return {"period": period, "omset": float(d["estimasi_omset"]), "sales": d["target_unit"], "id": d["id_target"]}
+
+@app.post("/target")
+def set_target(payload: TargetUpdate):
+    with engine.begin() as conn:
+        existing = conn.execute(text("SELECT id_target FROM target_bulanan WHERE bulan_tahun=:bulan"), {"bulan": payload.bulan_tahun}).fetchone()
+        if existing:
+            conn.execute(text("UPDATE target_bulanan SET target_unit=:unit, estimasi_omset=:omset WHERE id_target=:id"), {"unit": payload.target_unit, "omset": payload.estimasi_omset, "id": existing[0]})
+        else:
+            conn.execute(text("INSERT INTO target_bulanan (bulan_tahun, target_unit, estimasi_omset) VALUES (:bulan, :unit, :omset)"), {"bulan": payload.bulan_tahun, "unit": payload.target_unit, "omset": payload.estimasi_omset})
+    return get_target()
+
+# ------------------------
+# Promosi
+# ------------------------
+@app.get("/promosi")
+def get_promosi():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT id_promosi AS id, title, detail, author FROM promosi ORDER BY created_at DESC")).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+@app.post("/promosi")
+def add_promosi(payload: PromosiCreate):
+    with engine.begin() as conn:
+        result = conn.execute(text("INSERT INTO promosi (title, detail, author) VALUES (:title, :detail, :author)"), {"title": payload.title, "detail": payload.detail, "author": payload.author})
+        new_id = result.lastrowid
+    return {"id": new_id, "title": payload.title, "detail": payload.detail, "author": payload.author}
+
+@app.delete("/promosi/{promosi_id}")
+def delete_promosi(promosi_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM promosi WHERE id_promosi=:id"), {"id": promosi_id})
+    return {"status": "success"}
+
+# ------------------------
+# Laporan staff + CSV
+# ------------------------
+@app.get("/laporan")
+def get_laporan(petugas: Optional[str] = None):
+    query = "SELECT id_laporan AS id, petugas, units, omset, filename, tanggal FROM laporan_staff"
+    params = {}
+    if petugas:
+        query += " WHERE petugas = :petugas"
+        params["petugas"] = petugas
+    query += " ORDER BY tanggal DESC"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+    result = []
+    for r in rows:
+        d = row_to_dict(r)
+        d["tanggal"] = d["tanggal"].strftime("%Y-%m-%d") if isinstance(d["tanggal"], datetime) else str(d["tanggal"])
+        d["omset"] = float(d["omset"])
+        result.append(d)
+    return result
+
+@app.post("/laporan")
+def add_laporan(payload: LaporanCreate):
+    with engine.begin() as conn:
+        result = conn.execute(text("INSERT INTO laporan_staff (petugas, units, omset, filename) VALUES (:petugas, :units, :omset, :filename)"), {"petugas": payload.petugas, "units": payload.units, "omset": payload.omset, "filename": payload.filename})
+        new_id = result.lastrowid
+    return {"id": new_id, "petugas": payload.petugas, "units": payload.units, "omset": payload.omset, "filename": payload.filename, "tanggal": datetime.now().strftime("%Y-%m-%d")}
+
+@app.get("/laporan/csv")
+def download_laporan_csv():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT tanggal, petugas, units, omset, filename FROM laporan_staff ORDER BY tanggal DESC")).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Tanggal", "Petugas", "Unit", "Omset", "File"])
+    for r in rows:
+        d = row_to_dict(r)
+        writer.writerow([d["tanggal"], d["petugas"], d["units"], d["omset"], d["filename"]])
+    output.seek(0)
+    return StreamingResponse(io.BytesIO(output.getvalue().encode()), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=laporan-penjualan.csv"})
+
+@app.get("/laporan/staff/csv")
+def download_laporan_staff_csv(petugas: Optional[str] = None, id_laporan: Optional[int] = None):
+    if not petugas and id_laporan is None:
+        raise HTTPException(status_code=400, detail="Petugas atau id_laporan harus diberikan untuk unduh laporan staff.")
+
+    query = "SELECT tanggal, petugas, units, omset, filename FROM laporan_staff"
+    conditions = []
+    params = {}
+    if petugas:
+        conditions.append("petugas = :petugas")
+        params["petugas"] = petugas
+    if id_laporan is not None:
+        conditions.append("id_laporan = :id_laporan")
+        params["id_laporan"] = id_laporan
+    query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY tanggal DESC"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Tanggal", "Petugas", "Unit", "Omset", "File"])
+    for r in rows:
+        d = row_to_dict(r)
+        writer.writerow([d["tanggal"], d["petugas"], d["units"], d["omset"], d["filename"]])
+    output.seek(0)
+    return StreamingResponse(io.BytesIO(output.getvalue().encode()), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=laporan-staff.csv"})
+
+# ------------------------
+# Start app hint
+# ------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

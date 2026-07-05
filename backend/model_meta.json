@@ -1,0 +1,57 @@
+{
+  "min_period": "2023-01-01T00:00:00",
+  "avg_units": {
+    "Honda Beat": {
+      "Cash": 1.3846153846153846,
+      "Credit": 2.9696969696969697
+    },
+    "Honda CB150R": {
+      "Cash": 1.0,
+      "Credit": 1.3333333333333333
+    },
+    "Honda CBR150R": {
+      "Cash": 1.0,
+      "Credit": 1.0833333333333333
+    },
+    "Honda CRF150L": {
+      "Cash": 1.0,
+      "Credit": 1.1111111111111112
+    },
+    "Honda PCX 160": {
+      "Cash": 1.3333333333333333,
+      "Credit": 2.5
+    },
+    "Honda Revo Fit": {
+      "Cash": 1.0,
+      "Credit": 1.25
+    },
+    "Honda Scoopy": {
+      "Cash": 1.0769230769230769,
+      "Credit": 2.9375
+    },
+    "Honda Stylo 160": {
+      "Cash": 1.2727272727272727,
+      "Credit": 2.9310344827586206
+    },
+    "Honda Supra X 125": {
+      "Cash": 1.1111111111111112,
+      "Credit": 1.2380952380952381
+    },
+    "Honda Vario 125": {
+      "Cash": 1.1538461538461537,
+      "Credit": 2.7096774193548385
+    },
+    "Honda Vario 160": {
+      "Cash": 1.4615384615384615,
+      "Credit": 3.2333333333333334
+    }
+  },
+  "default_units": 2.1228571428571428,
+  "training_metrics": {
+    "train_rmse": 37051.335871823394,
+    "val_rmse": 7613865.483536201,
+    "rows_total": 350,
+    "train_rows": 300,
+    "val_rows": 50
+  }
+}

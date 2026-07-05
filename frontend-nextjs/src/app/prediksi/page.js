@@ -45,8 +45,24 @@ export default function Prediksi() {
         return;
       }
       const data = await res.json();
+      console.debug('prediksi-tren response:', data);
       if (data?.data_tren && Array.isArray(data.data_tren)) {
-        setChartData(data.data_tren);
+        // Normalize and coerce values from backend (handle different keys like 'omzet' or 'value')
+        const normalized = data.data_tren.map((it, idx) => {
+          const omsetRaw = it.omset ?? it.omzet ?? it.value ?? it.prediksi ?? 0;
+          const omset = Number(omsetRaw) || 0;
+          const bulan = it.bulan ?? it.month ?? it.label ?? `Bulan ${idx + 1}`;
+          return {
+            ...it,
+            bulan,
+            omset,
+            rekomendasi: it.rekomendasi ?? it.saran ?? it.note ?? '-',
+          };
+        });
+        setChartData(normalized);
+      } else {
+        console.warn('prediksi-tren: unexpected response shape', data);
+        setError('Server mengembalikan format data tidak dikenal.');
       }
     } catch (e) {
       setError('Gagal terhubung ke server. Pastikan backend berjalan.');
@@ -60,8 +76,9 @@ export default function Prediksi() {
   const width    = 620;
   const height   = 300;
   const padding  = 40;
-  const maxValue = hasData ? Math.max(...chartData.map(i => i.omset)) * 1.1 : 100;
+  let maxValue = hasData ? Math.max(...chartData.map(i => Number(i.omset) || 0)) * 1.1 : 100;
   const minValue = 0;
+  if (!isFinite(maxValue) || maxValue <= minValue) maxValue = minValue + 1;
 
   const getX = (index) => padding + (index * (width - padding * 2)) / Math.max(chartData.length - 1, 1);
   const getY = (omset) => height - padding - ((omset - minValue) / (maxValue - minValue)) * (height - padding * 2);

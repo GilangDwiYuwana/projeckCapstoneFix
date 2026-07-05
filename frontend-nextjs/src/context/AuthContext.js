@@ -114,6 +114,49 @@ export function AuthProvider({ children }) {
     }
   };
 
+  const editStaff = async (id, payload) => {
+    try {
+      const body = {
+        nama_lengkap: payload.name,
+        email:        payload.email,
+        phone:        payload.phone || '',
+      };
+      if (payload.password) {
+        body.password = payload.password;
+      }
+
+      const res = await fetch(`${API_BASE}/staff/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Gagal memperbarui staff');
+      }
+      const updatedStaff = await res.json();
+      setStaffAccounts(prev => prev.map(item => item.id === id ? updatedStaff : item));
+      return updatedStaff;
+    } catch (e) {
+      console.error("editStaff error:", e);
+      throw e;
+    }
+  };
+
+  const deleteStaff = async (id) => {
+    try {
+      const res = await fetch(`${API_BASE}/staff/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Gagal menghapus staff');
+      }
+      setStaffAccounts(prev => prev.filter(item => item.id !== id));
+    } catch (e) {
+      console.error("deleteStaff error:", e);
+      throw e;
+    }
+  };
+
   // ── TARGET (backend expect: bulan_tahun, target_unit, estimasi_omset) ─
   const setTargetSettings = async ({ period, omset, sales }) => {
     try {
@@ -152,7 +195,7 @@ export function AuthProvider({ children }) {
 
   const value = useMemo(() => ({
     user, isHydrated, login, logout,
-    staffAccounts, fetchStaff, addStaff,
+    staffAccounts, fetchStaff, addStaff, editStaff, deleteStaff,
     targetSettings, setTargetSettings,
     promotionSuggestions, fetchPromosi, addPromotion,
   }), [user, staffAccounts, targetSettings, promotionSuggestions, isHydrated]);
@@ -162,6 +205,24 @@ export function AuthProvider({ children }) {
 
 export function useAuth() {
   const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth harus dipakai di dalam AuthProvider');
+  if (!ctx) {
+    console.warn('useAuth dipanggil di luar AuthProvider — mengembalikan nilai fallback.');
+    return {
+      user: null,
+      isHydrated: false,
+      login: async () => false,
+      logout: () => {},
+      staffAccounts: [],
+      fetchStaff: () => {},
+      addStaff: async () => {},
+      editStaff: async () => {},
+      deleteStaff: async () => {},
+      targetSettings: { period: 'Belum diatur', omset: 0, sales: 0 },
+      setTargetSettings: () => {},
+      promotionSuggestions: [],
+      fetchPromosi: () => {},
+      addPromotion: async () => {},
+    };
+  }
   return ctx;
 }

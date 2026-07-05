@@ -11,9 +11,12 @@ import numpy as np
 import pandas as pd
 import subprocess
 import os
+import sys
 import logging
 import io
 import csv
+import json
+import shutil
 import bcrypt
 
 from database import engine
@@ -36,12 +39,16 @@ app.add_middleware(
 # ─────────────────────────────────────────
 # AI MODEL
 # ─────────────────────────────────────────
-model     = xgb.XGBRegressor()
-le_produk = None
-le_metode = None
+model          = xgb.XGBRegressor()
+le_produk      = None
+le_metode      = None
+model_meta     = {}
+min_period     = None
+avg_units_map  = {}
+default_units  = 0.0
 
 def load_ai_assets():
-    global model, le_produk, le_metode
+    global model, le_produk, le_metode, model_meta, min_period, avg_units_map, default_units
     try:
         if os.path.exists("model_omset.json"):
             model.load_model("model_omset.json")
@@ -50,10 +57,56 @@ def load_ai_assets():
             le_produk = joblib.load("le_produk.pkl")
             le_metode = joblib.load("le_metode.pkl")
             logger.info("Encoder berhasil dimuat.")
+        if os.path.exists("model_meta.json"):
+            with open("model_meta.json", "r", encoding="utf-8") as f:
+                model_meta = json.load(f)
+            if "min_period" in model_meta:
+                min_period = datetime.fromisoformat(model_meta["min_period"])
+            avg_units_map = model_meta.get("avg_units", {})
+            default_units = float(model_meta.get("default_units", 0.0))
+            logger.info("Model metadata berhasil dimuat.")
     except Exception as e:
         logger.error(f"Gagal memuat aset AI: {e}")
 
-load_ai_assets()
+
+def init_extra_tables():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS promosi (
+                id_promosi INT AUTO_INCREMENT PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                detail TEXT NOT NULL,
+                author VARCHAR(255) DEFAULT 'Owner',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS laporan_staff (
+                id_laporan INT AUTO_INCREMENT PRIMARY KEY,
+                petugas VARCHAR(255) NOT NULL,
+                units INT NOT NULL,
+                omset DECIMAL(15,2) NOT NULL,
+                filename VARCHAR(255),
+                tanggal TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+    logger.info("Tabel promosi & laporan_staff siap.")
+
+
+def ensure_users_phone_column():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR(30) DEFAULT ''"))
+        logger.info("Kolom phone berhasil ditambahkan ke tabel users.")
+    except Exception as e:
+        logger.info(f"Kolom phone sudah ada atau tidak bisa ditambahkan: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    load_ai_assets()
+    init_extra_tables()
+    ensure_users_phone_column()
+    logger.info("Startup event complete.")
 
 # ═══════════════════════════════════════════════════════
 #  PYDANTIC MODELS
@@ -85,6 +138,12 @@ class StaffCreate(BaseModel):
     nama_lengkap: str
     email: str
     password: str
+    phone: Optional[str] = ""
+
+class StaffUpdate(BaseModel):
+    nama_lengkap: str
+    email: str
+    password: Optional[str] = None
     phone: Optional[str] = ""
 
 class TargetUpdate(BaseModel):
@@ -121,30 +180,6 @@ def row_to_dict(row):
 # ═══════════════════════════════════════════════════════
 #  STARTUP: pastikan tabel tambahan (promosi & laporan) ada
 # ═══════════════════════════════════════════════════════
-def init_extra_tables():
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS promosi (
-                id_promosi INT AUTO_INCREMENT PRIMARY KEY,
-                title VARCHAR(255) NOT NULL,
-                detail TEXT NOT NULL,
-                author VARCHAR(255) DEFAULT 'Owner',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS laporan_staff (
-                id_laporan INT AUTO_INCREMENT PRIMARY KEY,
-                petugas VARCHAR(255) NOT NULL,
-                units INT NOT NULL,
-                omset DECIMAL(15,2) NOT NULL,
-                filename VARCHAR(255),
-                tanggal TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-    logger.info("Tabel promosi & laporan_staff siap.")
-
-init_extra_tables()
 
 # ═══════════════════════════════════════════════════════
 #  AUTH
@@ -189,11 +224,10 @@ def login(req: LoginRequest):
 
     # Dukung password yang belum di-hash (migrasi awal) maupun yang sudah bcrypt
     stored = user["password_hash"]
-    valid = False
     if stored.startswith("$2b$") or stored.startswith("$2a$"):
         valid = verify_password(req.password, stored)
     else:
-        valid = (stored == req.password)  # fallback plain text lama
+        raise HTTPException(status_code=401, detail="Email atau password salah.")
 
     if not valid:
         raise HTTPException(status_code=401, detail="Email atau password salah.")
@@ -367,11 +401,17 @@ def check_dataset():
 async def upload_dataset(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+        filename = (file.filename or "").lower()
+        if filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents))
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            df = pd.read_excel(io.BytesIO(contents))
+        else:
+            raise HTTPException(status_code=400, detail="Tipe file tidak didukung. Unggah .csv, .xlsx, atau .xls.")
 
         required_cols = {"Tanggal", "Produk", "Jenis_Motor", "Jumlah_Terjual", "Harga_Satuan", "Total_Penjualan", "Metode_Bayar"}
         if not required_cols.issubset(set(df.columns)):
-            raise HTTPException(status_code=400, detail=f"Kolom CSV tidak sesuai. Wajib ada: {', '.join(required_cols)}")
+            raise HTTPException(status_code=400, detail=f"Kolom dataset tidak sesuai. Wajib ada: {', '.join(required_cols)}")
 
         df["Tanggal"] = pd.to_datetime(df["Tanggal"])
 
@@ -400,37 +440,77 @@ async def upload_dataset(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def get_python_command():
+    python_cmd = shutil.which("python") or shutil.which("python3")
+    if python_cmd:
+        return python_cmd
+    return sys.executable
+
 @app.post("/retrain")
 def run_retrain():
     try:
-        result = subprocess.run(["python", "train_model.py"], capture_output=True, text=True)
+        python_cmd = get_python_command()
+        timeout_seconds = 300
+        result = subprocess.run(
+            [python_cmd, "train_model.py"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds
+        )
         if result.returncode == 0:
             load_ai_assets()
-            return {"status": "success", "message": "Model berhasil dilatih ulang!"}
-        return {"status": "error", "message": result.stderr}
+            payload = {"status": "success", "message": "Model berhasil dilatih ulang!"}
+            if os.path.exists("model_meta.json"):
+                try:
+                    with open("model_meta.json", "r", encoding="utf-8") as f:
+                        payload["metrics"] = json.load(f).get("training_metrics", {})
+                except Exception:
+                    payload["metrics"] = {}
+            payload["stdout"] = result.stdout.strip()
+            return payload
+        return {"status": "error", "message": result.stderr.strip(), "stdout": result.stdout.strip()}
+    except subprocess.TimeoutExpired as e:
+        return {"status": "error", "message": f"Proses retrain melebihi batas waktu {timeout_seconds} detik.", "stdout": e.stdout or "", "stderr": e.stderr or ""}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @app.get("/prediksi-tren")
 def get_prediksi_tren(produk: str, metode: str, jumlah_bulan: int):
-    if le_produk is None or le_metode is None:
-        raise HTTPException(status_code=400, detail="Model belum dilatih. Lakukan Training terlebih dahulu.")
+    global min_period, avg_units_map, default_units
+    if le_produk is None or le_metode is None or min_period is None:
+        raise HTTPException(status_code=400, detail="Model belum dilatih atau metadata model tidak tersedia. Lakukan Training terlebih dahulu.")
+    try:
+        p_enc = le_produk.transform([produk])[0]
+        m_enc = le_metode.transform([metode])[0]
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Produk '{produk}' atau metode '{metode}' tidak dikenal.")
+
+    try:
+        base_units = float(avg_units_map.get(produk, {}).get(metode, default_units))
+    except Exception:
+        base_units = default_units
+
     now = datetime.now()
     hasil = []
     for i in range(1, jumlah_bulan + 1):
-        total_bulan  = now.month + i - 1
-        target_tahun = now.year + (total_bulan // 12)
-        target_bulan = (total_bulan % 12) + 1
-        try:
-            p_enc = le_produk.transform([produk])[0]
-            m_enc = le_metode.transform([metode])[0]
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Produk '{produk}' atau metode '{metode}' tidak dikenal.")
-        pred = float(model.predict(np.array([[p_enc, m_enc, target_tahun, target_bulan]]))[0])
-        if pred < 50000000:    rec = "Omset rendah, saran: promo diskon."
-        elif pred > 100000000: rec = "Omset tinggi, fokus pelayanan VIP."
-        else:                  rec = "Stok aman, pertahankan penjualan."
-        hasil.append({"bulan": f"{target_bulan}-{target_tahun}", "omset": round(pred, 2), "rekomendasi": rec})
+        target_dt = pd.Timestamp(now) + pd.DateOffset(months=i)
+        month_index = ((target_dt.year - min_period.year) * 12 + (target_dt.month - min_period.month))
+        sin_month = np.sin(2 * np.pi * target_dt.month / 12)
+        cos_month = np.cos(2 * np.pi * target_dt.month / 12)
+        feat = np.array([[p_enc, m_enc, month_index, sin_month, cos_month, base_units]], dtype=float)
+        pred = float(model.predict(feat)[0])
+        if pred < 50000000:
+            rec = "Omset rendah, saran: promo diskon."
+        elif pred > 100000000:
+            rec = "Omset tinggi, fokus pelayanan VIP."
+        else:
+            rec = "Stok aman, pertahankan penjualan."
+        hasil.append({
+            "bulan": f"{target_dt.month}-{target_dt.year}",
+            "omset": round(pred, 2),
+            "rekomendasi": rec,
+            "units_proxy": round(base_units, 2)
+        })
     return {"data_tren": hasil}
 
 # ═══════════════════════════════════════════════════════
@@ -440,7 +520,7 @@ def get_prediksi_tren(produk: str, metode: str, jumlah_bulan: int):
 def get_staff():
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT id_user AS id, nama_lengkap AS name, email, role
+            SELECT id_user AS id, nama_lengkap AS name, email, phone, role
             FROM users WHERE role = 'Staff'
             ORDER BY id_user DESC
         """)).fetchall()
@@ -454,14 +534,49 @@ def create_staff(payload: StaffCreate):
         raise HTTPException(status_code=400, detail="Email sudah terdaftar.")
 
     hashed = hash_password(payload.password)
+    phone_value = payload.phone or ""
     with engine.begin() as conn:
         result = conn.execute(
-            text("""INSERT INTO users (nama_lengkap, email, password_hash, role, status)
-                     VALUES (:nama, :email, :pw, 'Staff', 'Aktif')"""),
-            {"nama": payload.nama_lengkap, "email": payload.email, "pw": hashed}
+            text("""INSERT INTO users (nama_lengkap, email, password_hash, phone, role, status)
+                     VALUES (:nama, :email, :pw, :phone, 'Staff', 'Aktif')"""),
+            {"nama": payload.nama_lengkap, "email": payload.email, "pw": hashed, "phone": phone_value}
         )
         new_id = result.lastrowid
-    return {"id": new_id, "name": payload.nama_lengkap, "email": payload.email, "phone": payload.phone, "role": "staff"}
+    return {"id": new_id, "name": payload.nama_lengkap, "email": payload.email, "phone": phone_value, "role": "staff"}
+
+@app.put("/staff/{staff_id}")
+def update_staff(staff_id: int, payload: StaffUpdate):
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text("SELECT id_user FROM users WHERE id_user=:id AND role='Staff'"),
+            {"id": staff_id}
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Staff tidak ditemukan.")
+
+        email_taken = conn.execute(
+            text("SELECT id_user FROM users WHERE email=:email AND id_user != :id"),
+            {"email": payload.email, "id": staff_id}
+        ).fetchone()
+        if email_taken:
+            raise HTTPException(status_code=400, detail="Email sudah digunakan akun lain.")
+
+        phone_value = payload.phone or ""
+        if payload.password:
+            hashed = hash_password(payload.password)
+            conn.execute(
+                text("""UPDATE users SET nama_lengkap=:nama, email=:email,
+                         password_hash=:pw, phone=:phone WHERE id_user=:id"""),
+                {"nama": payload.nama_lengkap, "email": payload.email, "pw": hashed, "phone": phone_value, "id": staff_id}
+            )
+        else:
+            conn.execute(
+                text("""UPDATE users SET nama_lengkap=:nama, email=:email,
+                         phone=:phone WHERE id_user=:id"""),
+                {"nama": payload.nama_lengkap, "email": payload.email, "phone": phone_value, "id": staff_id}
+            )
+
+    return {"id": staff_id, "name": payload.nama_lengkap, "email": payload.email, "phone": phone_value, "role": "staff"}
 
 @app.delete("/staff/{staff_id}")
 def delete_staff(staff_id: int):
@@ -536,16 +651,21 @@ def delete_promosi(promosi_id: int):
 #  LAPORAN STAFF
 # ═══════════════════════════════════════════════════════
 @app.get("/laporan")
-def get_laporan():
+def get_laporan(petugas: Optional[str] = None):
+    query = "SELECT id_laporan AS id, petugas, units, omset, filename, tanggal FROM laporan_staff"
+    params = {}
+    if petugas:
+        query += " WHERE petugas = :petugas"
+        params["petugas"] = petugas
+    query += " ORDER BY tanggal DESC"
+
     with engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT id_laporan AS id, petugas, units, omset, filename, tanggal FROM laporan_staff ORDER BY tanggal DESC"
-        )).fetchall()
+        rows = conn.execute(text(query), params).fetchall()
     result = []
     for r in rows:
         d = row_to_dict(r)
         d["tanggal"] = d["tanggal"].strftime("%Y-%m-%d") if isinstance(d["tanggal"], datetime) else str(d["tanggal"])
-        d["omset"]   = float(d["omset"])
+        d["omset"] = float(d["omset"])
         result.append(d)
     return result
 
@@ -566,6 +686,7 @@ def add_laporan(payload: LaporanCreate):
 
 @app.get("/laporan/csv")
 def download_laporan_csv():
+    # Unduh laporan penjualan umum: semua staff dan semua entri.
     with engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT tanggal, petugas, units, omset, filename FROM laporan_staff ORDER BY tanggal DESC"
@@ -583,3 +704,42 @@ def download_laporan_csv():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=laporan-penjualan.csv"}
     )
+
+@app.get("/laporan/staff/csv")
+def download_laporan_staff_csv(petugas: Optional[str] = None, id_laporan: Optional[int] = None):
+    # Unduh laporan khusus staff: gunakan petugas atau id_laporan.
+    if not petugas and id_laporan is None:
+        raise HTTPException(status_code=400, detail="Petugas atau id_laporan harus diberikan untuk unduh laporan staff.")
+
+    query = "SELECT tanggal, petugas, units, omset, filename FROM laporan_staff"
+    conditions = []
+    params = {}
+    if petugas:
+        conditions.append("petugas = :petugas")
+        params["petugas"] = petugas
+    if id_laporan is not None:
+        conditions.append("id_laporan = :id_laporan")
+        params["id_laporan"] = id_laporan
+    query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY tanggal DESC"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Tanggal", "Petugas", "Unit", "Omset", "File"])
+    for r in rows:
+        d = row_to_dict(r)
+        writer.writerow([d["tanggal"], d["petugas"], d["units"], d["omset"], d["filename"]])
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=laporan-staff.csv"}
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

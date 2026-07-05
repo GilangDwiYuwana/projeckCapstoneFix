@@ -19,6 +19,7 @@ export default function DashboardContent() {
   const [salesSummary, setSalesSummary]         = useState({ currentMonthSales: 0, currentMonthOmset: 0, previousMonthOmset: 0 });
   const [staffPerformance, setStaffPerformance] = useState([]);
   const [loadingStats, setLoadingStats]         = useState(true);
+  const [downloadLoading, setDownloadLoading]   = useState(false);
 
   // Form laporan staff
   const [reportUnits, setReportUnits]   = useState('');
@@ -111,6 +112,31 @@ export default function DashboardContent() {
       console.error("Gagal kirim laporan:", e);
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleAdminDownload = async (petugas = null) => {
+    setDownloadLoading(true);
+    try {
+      const apiUrl = petugas
+        ? `${API_BASE}/laporan/staff/csv?petugas=${encodeURIComponent(petugas)}`
+        : `${API_BASE}/laporan/csv`;
+      const res = await fetch(apiUrl);
+      if (!res.ok) throw new Error('Gagal mengunduh laporan');
+      const blob = await res.blob();
+      const fileUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = fileUrl;
+      anchor.download = petugas ? `laporan-${petugas}.csv` : 'laporan-penjualan.csv';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(fileUrl);
+    } catch (e) {
+      console.error('Gagal download laporan:', e);
+      alert('Gagal mengunduh laporan. Periksa koneksi atau server API.');
+    } finally {
+      setDownloadLoading(false);
     }
   };
 
@@ -257,8 +283,8 @@ export default function DashboardContent() {
                       <p className="font-bold text-slate-900">{staff.name}</p>
                       <p className="text-xs text-slate-500">Diperbarui: {staff.reportDate}</p>
                     </div>
-                    <button className="inline-flex items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100 transition">
-                      <Download className="h-3.5 w-3.5" /> Unduh Dokumen
+                    <button type="button" onClick={() => handleAdminDownload(staff.name)} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100 transition">
+                      {downloadLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} Unduh Dokumen
                     </button>
                   </div>
                   <div className="grid grid-cols-2 gap-4 text-sm">
