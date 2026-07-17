@@ -9,6 +9,16 @@ from database import engine  # pastikan database.py benar
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import mean_squared_error
 
+
+def calculate_mape(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = y_true != 0
+    if not np.any(mask):
+        return float('nan')
+    return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
+
+
 def train_model():
     try:
         print("Mengambil data dari database...")
@@ -68,7 +78,7 @@ def train_model():
 
         print(f"Rows total={len(agg)}, train={len(X_train)}, val={len(X_val)}")
 
-        # XGBoost training with early stopping
+        # Definisi model (parameter/hyperparameter XGBoost) 
         model = xgb.XGBRegressor(
             objective='reg:squarederror',
             n_estimators=2000,
@@ -107,10 +117,20 @@ def train_model():
 
         # EVALUASI sederhana
         train_pred = model.predict(X_train)
-        print("Train RMSE:", np.sqrt(mean_squared_error(y_train, train_pred)))
+        train_rmse = float(np.sqrt(mean_squared_error(y_train, train_pred)))
+        train_mape = calculate_mape(y_train, train_pred)
+        print("Train RMSE:", train_rmse)
+        print("Train MAPE:", train_mape, "%")
+
         if len(X_val) > 0:
             val_pred = model.predict(X_val)
-            print("Val RMSE:  ", np.sqrt(mean_squared_error(y_val, val_pred)))
+            val_rmse = float(np.sqrt(mean_squared_error(y_val, val_pred)))
+            val_mape = calculate_mape(y_val, val_pred)
+            print("Val RMSE:  ", val_rmse)
+            print("Val MAPE:  ", val_mape, "%")
+        else:
+            val_rmse = None
+            val_mape = None
 
         # SIMULASI: contoh prediksi untuk beberapa future months (cek variasi)
         print("Contoh prediksi (produk/metode pertama, 6 bulan ke depan):")
@@ -145,8 +165,10 @@ def train_model():
             "avg_units": avg_units,
             "default_units": default_units,
             "training_metrics": {
-                "train_rmse": float(np.sqrt(mean_squared_error(y_train, train_pred))),
-                "val_rmse": float(np.sqrt(mean_squared_error(y_val, val_pred))) if len(X_val) > 0 else None,
+                "train_rmse": train_rmse,
+                "train_mape": train_mape,
+                "val_rmse": val_rmse,
+                "val_mape": val_mape,
                 "rows_total": len(agg),
                 "train_rows": len(X_train),
                 "val_rows": len(X_val)

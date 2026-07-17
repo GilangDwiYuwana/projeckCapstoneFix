@@ -20,6 +20,7 @@ import shutil
 import bcrypt
 
 from database import engine
+from redis_client import r
 
 # ─────────────────────────────────────────
 # SETUP
@@ -177,6 +178,33 @@ def verify_password(plain: str, hashed: str) -> bool:
 def row_to_dict(row):
     return dict(row._mapping)
 
+# ─────────────────────────────────────────
+# REDIS CACHE HELPERS
+# ─────────────────────────────────────────
+def cache_get(key: str):
+    """Ambil data dari Redis. Return None kalau tidak ada / gagal."""
+    try:
+        cached = r.get(key)
+        return json.loads(cached) if cached else None
+    except Exception as e:
+        logger.warning(f"Redis GET gagal ({key}): {e}")
+        return None
+
+def cache_set(key: str, value, ttl: int = 300):
+    """Simpan data ke Redis dengan masa berlaku (detik). Default 5 menit."""
+    try:
+        r.setex(key, ttl, json.dumps(value, default=str))
+    except Exception as e:
+        logger.warning(f"Redis SET gagal ({key}): {e}")
+
+def cache_delete(*keys: str):
+    """Hapus cache — dipanggil setelah data berubah (create/update/delete)."""
+    try:
+        if keys:
+            r.delete(*keys)
+    except Exception as e:
+        logger.warning(f"Redis DELETE gagal ({keys}): {e}")
+
 # ═══════════════════════════════════════════════════════
 #  STARTUP: pastikan tabel tambahan (promosi & laporan) ada
 # ═══════════════════════════════════════════════════════
@@ -248,6 +276,10 @@ def login(req: LoginRequest):
 # ═══════════════════════════════════════════════════════
 @app.get("/produk")
 def get_produk():
+    cached = cache_get("produk:all")
+    if cached is not None:
+        return cached
+
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT p.id_produk AS id, p.nama_motor AS name, p.kategori AS category,
@@ -256,7 +288,9 @@ def get_produk():
             LEFT JOIN stok_barang s ON s.id_produk = p.id_produk
             ORDER BY p.id_produk
         """)).fetchall()
-    return [row_to_dict(r) for r in rows]
+    hasil = [row_to_dict(row) for row in rows]
+    cache_set("produk:all", hasil, ttl=300)
+    return hasil
 
 @app.post("/produk")
 def add_produk(payload: ProdukCreate):
@@ -270,6 +304,7 @@ def add_produk(payload: ProdukCreate):
             text("INSERT INTO stok_barang (id_produk, sisa_stok) VALUES (:id_produk, :stok)"),
             {"id_produk": new_id, "stok": payload.stok_awal}
         )
+    cache_delete("produk:all")
     return {
         "id": new_id, "name": payload.nama_motor, "category": payload.kategori,
         "price": payload.harga_terbaru, "stock": payload.stok_awal
@@ -288,6 +323,7 @@ def update_produk(produk_id: int, payload: ProdukUpdate):
             text("SELECT sisa_stok FROM stok_barang WHERE id_produk=:id"), {"id": produk_id}
         ).fetchone()
     stok = stok_row[0] if stok_row else 0
+    cache_delete("produk:all")
     return {"id": produk_id, "name": payload.nama_motor, "category": payload.kategori,
             "price": payload.harga_terbaru, "stock": stok}
 
@@ -296,6 +332,7 @@ def delete_produk(produk_id: int):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM stok_barang WHERE id_produk=:id"), {"id": produk_id})
         conn.execute(text("DELETE FROM produk WHERE id_produk=:id"), {"id": produk_id})
+    cache_delete("produk:all")
     return {"status": "success"}
 
 # ═══════════════════════════════════════════════════════
@@ -349,6 +386,9 @@ def update_stok(produk_id: int, payload: StokUpdate):
 
         nama_row = conn.execute(text("SELECT nama_motor FROM produk WHERE id_produk=:id"), {"id": produk_id}).fetchone()
         nama = nama_row[0] if nama_row else ""
+
+    # stok berubah -> data /produk (yang menampilkan kolom stock) jadi basi, hapus cache-nya
+    cache_delete("produk:all")
 
     return {
         "stok": {"id": produk_id, "nama": nama, "stok": sisa_stok},
@@ -518,13 +558,19 @@ def get_prediksi_tren(produk: str, metode: str, jumlah_bulan: int):
 # ═══════════════════════════════════════════════════════
 @app.get("/staff")
 def get_staff():
+    cached = cache_get("staff:all")
+    if cached is not None:
+        return cached
+
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT id_user AS id, nama_lengkap AS name, email, phone, role
             FROM users WHERE role = 'Staff'
             ORDER BY id_user DESC
         """)).fetchall()
-    return [row_to_dict(r) for r in rows]
+    hasil = [row_to_dict(row) for row in rows]
+    cache_set("staff:all", hasil, ttl=300)
+    return hasil
 
 @app.post("/staff")
 def create_staff(payload: StaffCreate):
@@ -542,6 +588,7 @@ def create_staff(payload: StaffCreate):
             {"nama": payload.nama_lengkap, "email": payload.email, "pw": hashed, "phone": phone_value}
         )
         new_id = result.lastrowid
+    cache_delete("staff:all")
     return {"id": new_id, "name": payload.nama_lengkap, "email": payload.email, "phone": phone_value, "role": "staff"}
 
 @app.put("/staff/{staff_id}")
@@ -576,12 +623,14 @@ def update_staff(staff_id: int, payload: StaffUpdate):
                 {"nama": payload.nama_lengkap, "email": payload.email, "phone": phone_value, "id": staff_id}
             )
 
+    cache_delete("staff:all")
     return {"id": staff_id, "name": payload.nama_lengkap, "email": payload.email, "phone": phone_value, "role": "staff"}
 
 @app.delete("/staff/{staff_id}")
 def delete_staff(staff_id: int):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM users WHERE id_user=:id AND role='Staff'"), {"id": staff_id})
+    cache_delete("staff:all")
     return {"status": "success"}
 
 # ═══════════════════════════════════════════════════════
@@ -589,16 +638,24 @@ def delete_staff(staff_id: int):
 # ═══════════════════════════════════════════════════════
 @app.get("/target")
 def get_target():
+    cached = cache_get("target:latest")
+    if cached is not None:
+        return cached
+
     with engine.connect() as conn:
         row = conn.execute(text(
             "SELECT * FROM target_bulanan ORDER BY bulan_tahun DESC LIMIT 1"
         )).fetchone()
     if not row:
-        return {"period": "Belum diatur", "omset": 0, "sales": 0}
+        hasil = {"period": "Belum diatur", "omset": 0, "sales": 0}
+        cache_set("target:latest", hasil, ttl=300)
+        return hasil
     d = row_to_dict(row)
     bulan_tahun = d["bulan_tahun"]
     period = bulan_tahun.strftime("%B %Y") if isinstance(bulan_tahun, date) else str(bulan_tahun)
-    return {"period": period, "omset": float(d["estimasi_omset"]), "sales": d["target_unit"], "id": d["id_target"]}
+    hasil = {"period": period, "omset": float(d["estimasi_omset"]), "sales": d["target_unit"], "id": d["id_target"]}
+    cache_set("target:latest", hasil, ttl=300)
+    return hasil
 
 @app.post("/target")
 def set_target(payload: TargetUpdate):
@@ -618,6 +675,7 @@ def set_target(payload: TargetUpdate):
                          VALUES (:bulan, :unit, :omset)"""),
                 {"bulan": payload.bulan_tahun, "unit": payload.target_unit, "omset": payload.estimasi_omset}
             )
+    cache_delete("target:latest")
     return get_target()
 
 # ═══════════════════════════════════════════════════════
@@ -625,11 +683,17 @@ def set_target(payload: TargetUpdate):
 # ═══════════════════════════════════════════════════════
 @app.get("/promosi")
 def get_promosi():
+    cached = cache_get("promosi:all")
+    if cached is not None:
+        return cached
+
     with engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT id_promosi AS id, title, detail, author FROM promosi ORDER BY created_at DESC"
         )).fetchall()
-    return [row_to_dict(r) for r in rows]
+    hasil = [row_to_dict(row) for row in rows]
+    cache_set("promosi:all", hasil, ttl=300)
+    return hasil
 
 @app.post("/promosi")
 def add_promosi(payload: PromosiCreate):
@@ -639,12 +703,14 @@ def add_promosi(payload: PromosiCreate):
             {"title": payload.title, "detail": payload.detail, "author": payload.author}
         )
         new_id = result.lastrowid
+    cache_delete("promosi:all")
     return {"id": new_id, "title": payload.title, "detail": payload.detail, "author": payload.author}
 
 @app.delete("/promosi/{promosi_id}")
 def delete_promosi(promosi_id: int):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM promosi WHERE id_promosi=:id"), {"id": promosi_id})
+    cache_delete("promosi:all")
     return {"status": "success"}
 
 # ═══════════════════════════════════════════════════════

@@ -49,7 +49,9 @@
   "default_units": 2.1228571428571428,
   "training_metrics": {
     "train_rmse": 37051.335871823394,
+    "train_mape": 0.07630202537912349,
     "val_rmse": 7613865.483536201,
+    "val_mape": 7.922761504305691,
     "rows_total": 350,
     "train_rows": 300,
     "val_rows": 50
